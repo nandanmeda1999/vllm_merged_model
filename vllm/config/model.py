@@ -287,6 +287,7 @@ class ModelConfig:
     interleave_mm_strings: InitVar[Optional[bool]] = None
     skip_mm_profiling: InitVar[Optional[bool]] = None
     video_pruning_rate: InitVar[Optional[float]] = None
+    model_to_copy_from: Optional[torch.nn.Module] = None
 
     def compute_hash(self) -> str:
         """

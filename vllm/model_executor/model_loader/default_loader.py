@@ -24,6 +24,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator, safetensors_weights_iterator)
 from vllm.platforms import current_platform
 
+from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary, cudaIpcMemHandle_t
+import ctypes
+import cupy as cp
+
 logger = init_logger(__name__)
 
 
@@ -261,8 +265,51 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
+        model_to_copy_from = model_config.model_to_copy_from
+
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
+
+        if model_to_copy_from is not None:
+            # print("========", model_to_copy_from.model.layers[5])
+            # model.model.layers[1].self_attn = model_to_copy_from.model.layers[1].self_attn
+            model.model.layers[1].mlp = model_to_copy_from.model.layers[1].mlp
+            model.model.layers[2].mlp = model_to_copy_from.model.layers[2].mlp
+        
+        # param_to_copy = None
+        # for name, param in model.named_parameters():
+        #     print(name, hex(param.data_ptr()))
+        #     param_to_copy = param
+        #     break
+        
+        lib = CudaRTLibrary()
+        lib.cudaSetDevice(0)
+        tmp = lib.cudaMalloc(1)
+        lib.cudaFree(tmp)  # ensure context exists
+
+        shared_mem_file = "cuda_ipc_handle.bin"
+        # check if file exists
+        if not os.path.exists(shared_mem_file):
+            param_to_copy = model.model.layers[0].self_attn.qkv_proj.weight
+            handle = lib.cudaIpcGetMemHandle(param_to_copy.data_ptr())
+            print("=========pointer", param_to_copy.data_ptr())
+            print("=========shape", param_to_copy.shape)
+            print("=========dtype", param_to_copy.dtype)
+            handle_bytes = ctypes.string_at(ctypes.addressof(handle), size=128)
+            with open(shared_mem_file, "wb") as f:
+                f.write(handle_bytes)
+        else:
+            try:
+                with open(shared_mem_file, "rb") as f:
+                    handle_bytes = f.read()
+            except FileNotFoundError:
+                print("Wait for sender to create the file...")
+            param_shape = (12288, 4096)  # replace with your actual shape
+            dtype = torch.bfloat16
+            self.load_ipc_param_into_module(model.model.layers[0].self_attn.qkv_proj, handle_bytes, param_shape, dtype)
+            print(f"Successfully created Parameter of shape from shared memory.")
+
+
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
             "Loading weights took %.2f seconds",
@@ -275,3 +322,40 @@ class DefaultModelLoader(BaseModelLoader):
             if weights_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
+
+
+    @torch._dynamo.disable   # <-- critical
+    def load_ipc_param_into_module(self, module, handle_bytes, shape, dtype, device="cuda:0"):
+        """Replace a module's parameter with a tensor backed by a CUDA IPC pointer."""
+
+        lib = CudaRTLibrary()
+        lib.cudaSetDevice(0)
+        # ---- 1. Decode handle ----
+        handle = cudaIpcMemHandle_t.from_buffer_copy(handle_bytes)
+        pointer = lib.cudaIpcOpenMemHandle(handle)
+        if pointer is None or pointer.value == 0:
+            raise RuntimeError("cudaIpcOpenMemHandle failed")
+
+        # ---- 2. Build CuPy array from raw pointer ----
+        cp_dtype = {
+            torch.float16: cp.float16,
+            torch.bfloat16: cp.float16,
+            torch.float32: cp.float32,
+            torch.int8: cp.int8,
+        }[dtype]
+
+        nbytes = cp.dtype(cp_dtype).itemsize * int(cp.prod(cp.asarray(shape)))
+
+        mem = cp.cuda.UnownedMemory(pointer.value, nbytes, owner=None)
+        ptr = cp.cuda.MemoryPointer(mem, 0)
+        # cupy_arr = cp.ndarray(shape, dtype=cp_dtype, memptr=ptr)
+        cupy_arr = cp.ndarray(shape, dtype=cp.uint16, memptr=ptr)
+
+        # ---- 3. Convert to Torch tensor *outside* Dynamo ----
+        tensor_uint16 = torch.as_tensor(cupy_arr, device=device)
+        tensor = tensor_uint16.view(torch.bfloat16)
+
+        # ---- 4. Replace the parameter on the module ----
+        with torch.no_grad():
+            # Ensure model sees it as a real Parameter
+            setattr(module, "weight", torch.nn.Parameter(tensor))

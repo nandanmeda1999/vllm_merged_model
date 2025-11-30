@@ -485,6 +485,8 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
+    model_to_copy_from: Optional[torch.nn.Module] = None
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -1043,6 +1045,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
+            model_to_copy_from=self.model_to_copy_from,
         )
 
     def validate_tensorizer_args(self):

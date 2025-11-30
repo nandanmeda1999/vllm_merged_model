@@ -568,6 +568,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        
+        # self.model_with_shared_weights = vllm_config.model_config.model_to_copy_from
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -607,6 +609,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+
+        # if self.model_with_shared_weights is not None:
+        #     print("model to copy from:", self.model_with_shared_weights)
+        #     print(self.model_with_shared_weights.model.layers)
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
