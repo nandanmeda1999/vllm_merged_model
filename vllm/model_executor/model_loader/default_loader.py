@@ -27,6 +27,8 @@ from vllm.platforms import current_platform
 from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary, cudaIpcMemHandle_t
 import ctypes
 import cupy as cp
+import base64
+import json
 
 logger = init_logger(__name__)
 
@@ -287,28 +289,41 @@ class DefaultModelLoader(BaseModelLoader):
         tmp = lib.cudaMalloc(1)
         lib.cudaFree(tmp)  # ensure context exists
 
-        shared_mem_file = "cuda_ipc_handle.bin"
-        # check if file exists
+        shared_mem_file = "cuda_ipc_handles.json"
         if not os.path.exists(shared_mem_file):
-            param_to_copy = model.model.layers[0].self_attn.qkv_proj.weight
-            handle = lib.cudaIpcGetMemHandle(param_to_copy.data_ptr())
-            print("=========pointer", param_to_copy.data_ptr())
-            print("=========shape", param_to_copy.shape)
-            print("=========dtype", param_to_copy.dtype)
-            handle_bytes = ctypes.string_at(ctypes.addressof(handle), size=128)
-            with open(shared_mem_file, "wb") as f:
-                f.write(handle_bytes)
+            params_to_copy = [
+                ("model.layers.0.self_attn.qkv_proj.weight", model.model.layers[0].self_attn.qkv_proj.weight),
+                ("model.layers.1.self_attn.qkv_proj.weight", model.model.layers[1].self_attn.qkv_proj.weight),
+                # 'model.layers.1.self_attn.qkv_proj.weight', 'model.layers.1.self_attn.o_proj.weight', 'model.layers.1.mlp.gate_up_proj.weight', 
+                # 'model.layers.1.mlp.down_proj.weight', 'model.layers.1.input_layernorm.weight', 'model.layers.1.post_attention_layernorm.weight'
+            ]
+            export_list = []
+            for name, param in params_to_copy:
+                handle = lib.cudaIpcGetMemHandle(param.data_ptr())
+                handle_bytes = ctypes.string_at(ctypes.addressof(handle), size=128)
+                handle_b64 = base64.b64encode(handle_bytes).decode("ascii")
+                entry = {
+                    "name": name,
+                    "handle": handle_b64,
+                    "shape": list(param.shape),
+                    "dtype": str(param.dtype) 
+                }
+                export_list.append(entry)
+            with open(shared_mem_file, "w") as f:
+                json.dump(export_list, f, indent=2)
         else:
-            try:
-                with open(shared_mem_file, "rb") as f:
-                    handle_bytes = f.read()
-            except FileNotFoundError:
-                print("Wait for sender to create the file...")
-            param_shape = (12288, 4096)  # replace with your actual shape
-            dtype = torch.bfloat16
-            self.load_ipc_param_into_module(model.model.layers[0].self_attn.qkv_proj, handle_bytes, param_shape, dtype)
-            print(f"Successfully created Parameter of shape from shared memory.")
-
+            with open(shared_mem_file, "r") as f:
+                records = json.load(f)
+            module_map = dict(model.named_modules())
+            for rec in records:
+                name = rec["name"]
+                module_name, param_name = name.rsplit(".", 1)
+                module = module_map[module_name]
+                shape = torch.Size(rec["shape"])
+                dtype = getattr(torch, rec["dtype"].split(".")[-1])
+                handle_b64 = rec["handle"]
+                handle_bytes = base64.b64decode(handle_b64)
+                self.load_ipc_param_into_module(module, handle_bytes, shape, dtype)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
@@ -339,7 +354,7 @@ class DefaultModelLoader(BaseModelLoader):
         # ---- 2. Build CuPy array from raw pointer ----
         cp_dtype = {
             torch.float16: cp.float16,
-            torch.bfloat16: cp.float16,
+            torch.bfloat16: cp.uint16,
             torch.float32: cp.float32,
             torch.int8: cp.int8,
         }[dtype]
@@ -348,14 +363,13 @@ class DefaultModelLoader(BaseModelLoader):
 
         mem = cp.cuda.UnownedMemory(pointer.value, nbytes, owner=None)
         ptr = cp.cuda.MemoryPointer(mem, 0)
-        # cupy_arr = cp.ndarray(shape, dtype=cp_dtype, memptr=ptr)
-        cupy_arr = cp.ndarray(shape, dtype=cp.uint16, memptr=ptr)
+        cupy_arr = cp.ndarray(shape, dtype=cp_dtype, memptr=ptr)
 
         # ---- 3. Convert to Torch tensor *outside* Dynamo ----
-        tensor_uint16 = torch.as_tensor(cupy_arr, device=device)
-        tensor = tensor_uint16.view(torch.bfloat16)
+        torch_arr = torch.as_tensor(cupy_arr, device=device)
+        if dtype == torch.bfloat16:
+            torch_arr = torch_arr.view(torch.bfloat16)
 
         # ---- 4. Replace the parameter on the module ----
         with torch.no_grad():
-            # Ensure model sees it as a real Parameter
-            setattr(module, "weight", torch.nn.Parameter(tensor))
+            setattr(module, "weight", torch.nn.Parameter(torch_arr))
