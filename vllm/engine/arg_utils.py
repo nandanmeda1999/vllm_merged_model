@@ -485,7 +485,9 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
-    model_to_copy_from: Optional[torch.nn.Module] = None
+    shared_layers_spec_path: Optional[str] = ModelConfig.shared_layers_spec_path
+    shared_layers_export_config_path: Optional[str] = ModelConfig.shared_layers_export_config_path
+    shared_layers_import_config_path: Optional[str] = ModelConfig.shared_layers_import_config_path
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -597,6 +599,12 @@ class EngineArgs:
                                  **model_kwargs["logits_processors"])
         model_group.add_argument("--io-processor-plugin",
                                  **model_kwargs["io_processor_plugin"])
+        model_group.add_argument("--shared-layers-spec-path",
+                                 **model_kwargs["shared_layers_spec_path"])
+        model_group.add_argument("--shared-layers-export-config-path",
+                                 **model_kwargs["shared_layers_export_config_path"])
+        model_group.add_argument("--shared-layers-import-config-path",
+                                 **model_kwargs["shared_layers_import_config_path"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -1045,7 +1053,9 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
-            model_to_copy_from=self.model_to_copy_from,
+            shared_layers_spec_path=self.shared_layers_spec_path,
+            shared_layers_export_config_path=self.shared_layers_export_config_path,
+            shared_layers_import_config_path=self.shared_layers_import_config_path,
         )
 
     def validate_tensorizer_args(self):

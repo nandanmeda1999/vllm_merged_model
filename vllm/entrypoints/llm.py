@@ -195,7 +195,9 @@ class LLM:
                                            CompilationConfig]] = None,
         logits_processors: Optional[list[Union[str,
                                                type[LogitsProcessor]]]] = None,
-        model_to_copy_from: Optional[nn.Module] = None,
+        shared_layers_spec_path: Optional[str] = None,
+        shared_layers_export_config_path: Optional[str] = None,
+        shared_layers_import_config_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -289,7 +291,9 @@ class LLM:
             structured_outputs_config=structured_outputs_instance,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
-            model_to_copy_from=model_to_copy_from,
+            shared_layers_spec_path=shared_layers_spec_path,
+            shared_layers_export_config_path=shared_layers_export_config_path,
+            shared_layers_import_config_path=shared_layers_import_config_path,
             **kwargs,
         )
 
