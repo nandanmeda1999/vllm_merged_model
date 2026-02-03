@@ -486,8 +486,7 @@ class EngineArgs:
         CacheConfig.kv_sharing_fast_prefill
 
     shared_layers_spec_path: Optional[str] = ModelConfig.shared_layers_spec_path
-    shared_layers_export_config_path: Optional[str] = ModelConfig.shared_layers_export_config_path
-    shared_layers_import_config_path: Optional[str] = ModelConfig.shared_layers_import_config_path
+    shared_layers_ptrs_path: Optional[str] = ModelConfig.shared_layers_ptrs_path
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -601,10 +600,8 @@ class EngineArgs:
                                  **model_kwargs["io_processor_plugin"])
         model_group.add_argument("--shared-layers-spec-path",
                                  **model_kwargs["shared_layers_spec_path"])
-        model_group.add_argument("--shared-layers-export-config-path",
-                                 **model_kwargs["shared_layers_export_config_path"])
-        model_group.add_argument("--shared-layers-import-config-path",
-                                 **model_kwargs["shared_layers_import_config_path"])
+        model_group.add_argument("--shared-layers-ptrs-path",
+                                 **model_kwargs["shared_layers_ptrs_path"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -1054,8 +1051,7 @@ class EngineArgs:
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
             shared_layers_spec_path=self.shared_layers_spec_path,
-            shared_layers_export_config_path=self.shared_layers_export_config_path,
-            shared_layers_import_config_path=self.shared_layers_import_config_path,
+            shared_layers_ptrs_path=self.shared_layers_ptrs_path,
         )
 
     def validate_tensorizer_args(self):

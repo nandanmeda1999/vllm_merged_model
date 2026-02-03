@@ -29,6 +29,7 @@ import ctypes
 import cupy as cp
 import base64
 import json
+import re
 
 logger = init_logger(__name__)
 
@@ -267,63 +268,20 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
-        model_to_copy_from = model_config.model_to_copy_from
 
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
-
-        if model_to_copy_from is not None:
-            # print("========", model_to_copy_from.model.layers[5])
-            # model.model.layers[1].self_attn = model_to_copy_from.model.layers[1].self_attn
-            model.model.layers[1].mlp = model_to_copy_from.model.layers[1].mlp
-            model.model.layers[2].mlp = model_to_copy_from.model.layers[2].mlp
-        
-        # param_to_copy = None
-        # for name, param in model.named_parameters():
-        #     print(name, hex(param.data_ptr()))
-        #     param_to_copy = param
-        #     break
         
         lib = CudaRTLibrary()
         lib.cudaSetDevice(0)
         tmp = lib.cudaMalloc(1)
         lib.cudaFree(tmp)  # ensure context exists
 
-        shared_mem_file = "cuda_ipc_handles.json"
-        if not os.path.exists(shared_mem_file):
-            params_to_copy = [
-                ("model.layers.0.self_attn.qkv_proj.weight", model.model.layers[0].self_attn.qkv_proj.weight),
-                ("model.layers.1.self_attn.qkv_proj.weight", model.model.layers[1].self_attn.qkv_proj.weight),
-                # 'model.layers.1.self_attn.qkv_proj.weight', 'model.layers.1.self_attn.o_proj.weight', 'model.layers.1.mlp.gate_up_proj.weight', 
-                # 'model.layers.1.mlp.down_proj.weight', 'model.layers.1.input_layernorm.weight', 'model.layers.1.post_attention_layernorm.weight'
-            ]
-            export_list = []
-            for name, param in params_to_copy:
-                handle = lib.cudaIpcGetMemHandle(param.data_ptr())
-                handle_bytes = ctypes.string_at(ctypes.addressof(handle), size=128)
-                handle_b64 = base64.b64encode(handle_bytes).decode("ascii")
-                entry = {
-                    "name": name,
-                    "handle": handle_b64,
-                    "shape": list(param.shape),
-                    "dtype": str(param.dtype) 
-                }
-                export_list.append(entry)
-            with open(shared_mem_file, "w") as f:
-                json.dump(export_list, f, indent=2)
-        else:
-            with open(shared_mem_file, "r") as f:
-                records = json.load(f)
-            module_map = dict(model.named_modules())
-            for rec in records:
-                name = rec["name"]
-                module_name, param_name = name.rsplit(".", 1)
-                module = module_map[module_name]
-                shape = torch.Size(rec["shape"])
-                dtype = getattr(torch, rec["dtype"].split(".")[-1])
-                handle_b64 = rec["handle"]
-                handle_bytes = base64.b64decode(handle_b64)
-                self.load_ipc_param_into_module(module, handle_bytes, shape, dtype)
+        if model_config.shared_layers_spec_path and os.path.exists(model_config.shared_layers_spec_path):
+            self.load_weight_pointers(lib, model, model_config)
+
+        # if model_config.shared_layers_ptrs_path:
+        #     self.store_weight_pointers(lib, model, model_config)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
@@ -338,9 +296,70 @@ class DefaultModelLoader(BaseModelLoader):
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
 
+    def store_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
+        model_name = model_config.model
 
-    @torch._dynamo.disable   # <-- critical
-    def load_ipc_param_into_module(self, module, handle_bytes, shape, dtype, device="cuda:0"):
+        for param_name, param in model.named_parameters():
+            # Parse layer + component
+            # Example: model.layers.1.self_attn.qkv_proj.weight
+            m = re.match(r"model\.layers\.(\d+)\.(.+)\.weight", param_name)
+            if not m:
+                # raise ValueError(f"Unrecognized parameter format: {param_name}")
+                continue
+
+            layer_idx = int(m.group(1))
+            component = m.group(2)
+
+            ALLOWED_COMPONENTS = (
+                "self_attn.qkv_proj",
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+                "mlp.gate_proj",
+                "mlp.gate_up_proj",
+            )
+
+            if component not in ALLOWED_COMPONENTS:
+                continue
+
+            handle = lib.cudaIpcGetMemHandle(param.data_ptr())
+            handle_bytes = ctypes.string_at(ctypes.addressof(handle), 128)
+            handle_b64 = base64.b64encode(handle_bytes).decode("ascii")
+
+            record = {
+                "model_name": model_name,
+                "layer": layer_idx,
+                "component": component,
+                "handle": handle_b64,
+                "shape": list(param.shape),
+                "dtype": str(param.dtype),
+            }
+
+            with open(model_config.shared_layers_ptrs_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+    def load_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
+        module_map = dict(model.named_modules())
+
+        with open(model_config.shared_layers_ptrs_path, "r") as f:
+            for line in f:
+                rec = json.loads(line)
+                layer = rec["layer"]
+                component = rec["component"]
+                shape = torch.Size(rec["shape"])
+                dtype = getattr(torch, rec["dtype"].split(".")[-1])
+                handle_bytes = base64.b64decode(rec["handle"])
+
+                module_name = f"model.layers.{layer}.{component}"
+                module = module_map[module_name]
+
+                self.load_ipc_param_into_module(lib, module, handle_bytes, shape, dtype)
+
+    @torch._dynamo.disable
+    def load_ipc_param_into_module(self, lib, module, handle_bytes, shape, dtype, device="cuda:0"):
         """Replace a module's parameter with a tensor backed by a CUDA IPC pointer."""
 
         lib = CudaRTLibrary()

@@ -288,8 +288,7 @@ class ModelConfig:
     skip_mm_profiling: InitVar[Optional[bool]] = None
     video_pruning_rate: InitVar[Optional[float]] = None
     shared_layers_spec_path: Optional[str] = None
-    shared_layers_export_config_path: Optional[str] = None
-    shared_layers_import_config_path: Optional[str] = None
+    shared_layers_ptrs_path: Optional[str] = None
 
     def compute_hash(self) -> str:
         """
