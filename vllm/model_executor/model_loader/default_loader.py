@@ -277,11 +277,34 @@ class DefaultModelLoader(BaseModelLoader):
         tmp = lib.cudaMalloc(1)
         lib.cudaFree(tmp)  # ensure context exists
 
-        if model_config.shared_layers_spec_path and os.path.exists(model_config.shared_layers_spec_path):
-            self.load_weight_pointers(lib, model, model_config)
+        shared_component_spec = {} # (my_layer, my_component) -> [(other_model, other_layer, other_component)]
+        loaded_shared_components = []
 
-        # if model_config.shared_layers_ptrs_path:
-        #     self.store_weight_pointers(lib, model, model_config)
+        if model_config.shared_layers_spec_path and os.path.exists(model_config.shared_layers_spec_path):
+            model_name = os.path.basename(os.path.normpath(model_config.model))
+            with open(model_config.shared_layers_spec_path) as f:
+                spec = json.load(f)
+            for group in spec:
+                for entry in group:
+                    if entry["model"] != model_name:
+                        continue
+                    my_key = (entry["layer"], entry["component"])
+                    others = [
+                        (m["model"], m["layer"], m["component"])
+                        for m in group
+                        if m["model"] != model_name
+                    ]
+                    shared_component_spec[my_key] = others
+        
+        if (
+            shared_component_spec
+            and model_config.shared_layers_ptrs_path
+            and os.path.exists(model_config.shared_layers_ptrs_path)
+        ):
+            loaded_shared_components = self.load_weight_pointers(lib, model, model_config, shared_component_spec)
+
+        if model_config.shared_layers_ptrs_path and shared_component_spec:
+            self.store_weight_pointers(lib, model, model_config, shared_component_spec, loaded_shared_components)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
@@ -296,11 +319,32 @@ class DefaultModelLoader(BaseModelLoader):
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
 
-    def store_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
-        model_name = model_config.model
+    def store_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig, shared_component_spec=None, loaded_layers=None) -> None:
+        model_name = os.path.basename(os.path.normpath(model_config.model))
+
+        if not shared_component_spec:
+            return
+
+        loaded_set = set()
+        if loaded_layers:
+            loaded_set = {
+                (entry["layer"], entry["component"])
+                for entry in loaded_layers
+            }
+
+        ALLOWED_COMPONENTS = (
+            "self_attn.qkv_proj",
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+            "mlp.gate_proj",
+            "mlp.gate_up_proj",
+        )
 
         for param_name, param in model.named_parameters():
-            # Parse layer + component
             # Example: model.layers.1.self_attn.qkv_proj.weight
             m = re.match(r"model\.layers\.(\d+)\.(.+)\.weight", param_name)
             if not m:
@@ -310,21 +354,15 @@ class DefaultModelLoader(BaseModelLoader):
             layer_idx = int(m.group(1))
             component = m.group(2)
 
-            ALLOWED_COMPONENTS = (
-                "self_attn.qkv_proj",
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.o_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-                "mlp.gate_proj",
-                "mlp.gate_up_proj",
-            )
+            if (layer_idx, component) in loaded_set:
+                continue
+
+            if (layer_idx, component) not in shared_component_spec.keys():
+                continue
 
             if component not in ALLOWED_COMPONENTS:
                 continue
-
+            
             handle = lib.cudaIpcGetMemHandle(param.data_ptr())
             handle_bytes = ctypes.string_at(ctypes.addressof(handle), 128)
             handle_b64 = base64.b64encode(handle_bytes).decode("ascii")
@@ -341,22 +379,57 @@ class DefaultModelLoader(BaseModelLoader):
             with open(model_config.shared_layers_ptrs_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
-    def load_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
+    def load_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig, shared_component_spec):
         module_map = dict(model.named_modules())
+        model_name = os.path.basename(os.path.normpath(model_config.model))
 
+        if not shared_component_spec:
+            return []
+
+        pointer_records = []
         with open(model_config.shared_layers_ptrs_path, "r") as f:
             for line in f:
-                rec = json.loads(line)
-                layer = rec["layer"]
-                component = rec["component"]
+                pointer_records.append(json.loads(line))
+
+        loaded_components = []
+
+        for my_key, others in shared_component_spec.items():
+            my_layer, my_component = my_key
+
+            for rec in pointer_records:
+                rec_tuple = (
+                    rec["model_name"],
+                    rec["layer"],
+                    rec["component"],
+                )
+
+                if rec_tuple not in others:
+                    continue
+
+                module_name = f"model.layers.{my_layer}.{my_component}"
+                if module_name not in module_map:
+                    continue
+
+                module = module_map[module_name]
                 shape = torch.Size(rec["shape"])
                 dtype = getattr(torch, rec["dtype"].split(".")[-1])
                 handle_bytes = base64.b64decode(rec["handle"])
 
-                module_name = f"model.layers.{layer}.{component}"
-                module = module_map[module_name]
-
                 self.load_ipc_param_into_module(lib, module, handle_bytes, shape, dtype)
+
+                loaded_components.append(
+                    {
+                        "layer": my_layer,
+                        "component": my_component,
+                        "source_model": rec["model_name"],
+                        "source_layer": rec["layer"],
+                        "source_component": rec["component"],
+                    }
+                )
+
+                break
+
+        return loaded_components
 
     @torch._dynamo.disable
     def load_ipc_param_into_module(self, lib, module, handle_bytes, shape, dtype, device="cuda:0"):

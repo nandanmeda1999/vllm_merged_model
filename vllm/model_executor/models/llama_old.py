@@ -38,8 +38,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -72,31 +71,13 @@ class LlamaMLP(nn.Module):
         disable_tp: bool = False,
     ) -> None:
         super().__init__()
-        # self.gate_up_proj = MergedColumnParallelLinear(
-        #     input_size=hidden_size,
-        #     output_sizes=[intermediate_size] * 2,
-        #     bias=bias,
-        #     quant_config=quant_config,
-        #     disable_tp=disable_tp,
-        #     prefix=f"{prefix}.gate_up_proj",
-        # )
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_size=intermediate_size,
+            output_sizes=[intermediate_size] * 2,
             bias=bias,
-            gather_output=False,
-            params_dtype=None,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            bias=bias,
-            gather_output=False,
-            params_dtype=None,
-            quant_config=quant_config,
-            prefix=f"{prefix}.up_proj",
+            disable_tp=disable_tp,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
@@ -113,11 +94,7 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        # x, _ = self.gate_up_proj(x)
-        # x = self.act_fn(x)
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
-        x = torch.cat([gate, up], dim=-1) 
+        x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
@@ -172,44 +149,14 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        # self.qkv_proj = QKVParallelLinear(
-        #     hidden_size=hidden_size,
-        #     head_size=self.head_dim,
-        #     total_num_heads=self.total_num_heads,
-        #     total_num_kv_heads=self.total_num_kv_heads,
-        #     bias=bias,
-        #     quant_config=quant_config,
-        #     prefix=f"{prefix}.qkv_proj",
-        # )
-
-        self.q_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=self.q_size,
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            gather_output=False,
-            params_dtype=None,
             quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-        )
-
-        self.k_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=self.kv_size,
-            bias=bias,
-            gather_output=False,
-            params_dtype=None,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
-        )
-
-        self.v_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=self.kv_size,
-            bias=bias,
-            gather_output=False,
-            params_dtype=None,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj",
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.o_proj = RowParallelLinear(
@@ -265,11 +212,8 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # qkv, _ = self.qkv_proj(hidden_states)
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
-        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -474,15 +418,16 @@ class LlamaModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = []
+        stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-        #     (".qkv_proj", ".q_proj", "q"),
-        #     (".qkv_proj", ".k_proj", "k"),
-        #     (".qkv_proj", ".v_proj", "v"),
-        #     (".gate_up_proj", ".gate_proj", 0),
-        #     (".gate_up_proj", ".up_proj", 1),
-        # ]
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
         params_dict = dict(self.named_parameters())
+        # print(params_dict)
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -511,7 +456,10 @@ class LlamaModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                # print("=====", param_name, weight_name, shard_id)
+                # print("=====name before", name)
                 name = name.replace(weight_name, param_name)
+                # print("=====name after", name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -520,7 +468,10 @@ class LlamaModel(nn.Module):
                     continue
 
                 param = params_dict[name]
+                # print("=====param", param.shape)
                 weight_loader = param.weight_loader
+                # print("=====weight_loader", weight_loader)
+                # print("=====loaded_weight", loaded_weight.shape)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -535,7 +486,9 @@ class LlamaModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+            # print("=======adding", name)
             loaded_params.add(name)
+            # print("=====param after", param)
         return loaded_params
 
 
