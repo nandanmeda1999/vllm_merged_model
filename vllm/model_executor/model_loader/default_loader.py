@@ -268,6 +268,8 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
+        # print the names of the weights to load for debugging
+        logger.info(f"Weights to load: {weights_to_load}")
 
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
@@ -302,6 +304,7 @@ class DefaultModelLoader(BaseModelLoader):
         for param_name, param in model.named_parameters():
             # Parse layer + component
             # Example: model.layers.1.self_attn.qkv_proj.weight
+            print(param_name)
             m = re.match(r"model\.layers\.(\d+)\.(.+)\.weight", param_name)
             if not m:
                 # raise ValueError(f"Unrecognized parameter format: {param_name}")
