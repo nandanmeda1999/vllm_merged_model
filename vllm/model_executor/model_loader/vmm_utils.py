@@ -65,11 +65,13 @@ class VMMCompositeWeight:
         shape: list[int],
         dtype: torch.dtype,
         exportable: bool = True,
+        skip_indices: Optional[set[int]] = None,
     ):
         self.device = device
         self.dtype = dtype
         self.shape = shape
         self.drv = CudaDriverLibrary()
+        self._skip_indices = skip_indices or set()
 
         # Get the physical device ordinal (driver API ignores CUDA_VISIBLE_DEVICES)
         self.physical_device = self.drv.get_physical_device()
@@ -97,13 +99,16 @@ class VMMCompositeWeight:
 
         # Reserve contiguous VA
         self.va_base = self.drv.reserve_va(self.total_aligned)
-        logger.info("VMM reserved VA: 0x%x, total %d bytes (%d chunks)",
-                    self.va_base, self.total_aligned, self.n_chunks)
+        logger.info("VMM reserved VA: 0x%x, total %d bytes (%d chunks, %d holes)",
+                    self.va_base, self.total_aligned, self.n_chunks,
+                    len(self._skip_indices))
 
-        # Allocate physical chunks and map them
+        # Allocate physical chunks and map them (skip holes)
         self.handles: list[Optional[int]] = [None] * self.n_chunks
         self.owned: list[bool] = [False] * self.n_chunks
         for i in range(self.n_chunks):
+            if i in self._skip_indices:
+                continue  # hole — VA reserved but no physical allocation
             h = self.drv.create_physical(self.physical_device,
                                          self.aligned_sizes[i],
                                          exportable=exportable)
@@ -112,12 +117,10 @@ class VMMCompositeWeight:
             self.drv.map_physical(self.va_base, self.offsets[i],
                                   self.aligned_sizes[i], h)
 
-        # Set access permissions on the full range
-        self.drv.set_access(self.physical_device, self.va_base,
-                            self.total_aligned)
-
-        # Build the torch tensor wrapping the VA
-        self._tensor = self._wrap_as_tensor()
+        # If no holes, finalize immediately (set access + wrap tensor)
+        self._tensor: Optional[torch.Tensor] = None
+        if not self._skip_indices:
+            self.finalize()
 
     def _wrap_as_tensor(self) -> torch.Tensor:
         """Wrap the contiguous VA as a PyTorch tensor via CuPy."""
@@ -136,9 +139,23 @@ class VMMCompositeWeight:
             tensor = tensor.view(torch.bfloat16)
         return tensor
 
+    def finalize(self) -> None:
+        """Set access permissions and wrap VA as tensor.
+
+        Must be called after all holes are filled via import_chunk_from_fd().
+        Called automatically in __init__ if there are no skip_indices.
+        """
+        assert all(h is not None for h in self.handles), \
+            "Cannot finalize: some chunks are still holes (not imported)"
+        self.drv.set_access(self.physical_device, self.va_base,
+                            self.total_aligned)
+        self._tensor = self._wrap_as_tensor()
+
     @property
     def tensor(self) -> torch.Tensor:
         """The contiguous tensor wrapping the full VA range."""
+        assert self._tensor is not None, \
+            "Tensor not ready — call finalize() after importing all holes"
         return self._tensor
 
     def export_chunk(self, index: int) -> tuple[int, int]:
@@ -155,20 +172,21 @@ class VMMCompositeWeight:
         return (os.getpid(), fd)
 
     def import_chunk_from_fd(self, index: int, fd: int) -> None:
-        """Replace physical chunk at index with memory imported from
-        a file descriptor that is already valid in THIS process.
+        """Import a physical chunk from a file descriptor into a hole or
+        replace an existing chunk.
 
-        Use send_fd/recv_fd or the registry socket mechanism to obtain
-        a valid local fd before calling this method.
+        The fd must be valid in THIS process (e.g., opened via
+        /proc/<pid>/fd/<fd> or received via Unix socket SCM_RIGHTS).
+
+        Call finalize() after all imports are done.
 
         Args:
-            index: which sub-component to replace (0=Q, 1=K, 2=V)
-            fd: file descriptor valid in THIS process (e.g., received
-                via Unix socket SCM_RIGHTS)
+            index: which sub-component to import (0=Q, 1=K, 2=V)
+            fd: file descriptor valid in THIS process
         """
         assert 0 <= index < self.n_chunks
 
-        # Unmap and release the existing chunk at this offset
+        # Unmap and release any existing chunk at this offset
         if self.handles[index] is not None:
             self.drv.unmap(self.va_base + self.offsets[index],
                            self.aligned_sizes[index])
@@ -181,10 +199,6 @@ class VMMCompositeWeight:
         # Map at the same offset
         self.drv.map_physical(self.va_base, self.offsets[index],
                               self.aligned_sizes[index], imported_handle)
-
-        # Re-set access on the full range
-        self.drv.set_access(self.physical_device, self.va_base,
-                            self.total_aligned)
 
         self.handles[index] = imported_handle
         self.owned[index] = False
@@ -205,7 +219,7 @@ def send_fd(sock: socket.socket, fd: int) -> None:
 def recv_fd(sock: socket.socket) -> int:
     """Receive a file descriptor from a Unix domain socket using SCM_RIGHTS."""
     fds = array.array("i")
-    msg, ancdata, flags, addr = sock.recvmsg(
+    _msg, ancdata, _flags, _addr = sock.recvmsg(
         1,
         socket.CMSG_SPACE(4)  # space for one int (fd)
     )
@@ -214,3 +228,66 @@ def recv_fd(sock: socket.socket) -> int:
             fds.frombytes(cmsg_data[:len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
             return fds[0]
     raise RuntimeError("No fd received via SCM_RIGHTS")
+
+
+def start_fd_server(socket_path: str, fd_map: dict[str, int]) -> None:
+    """Start a background thread serving DMA-BUF fds via Unix socket.
+
+    Args:
+        socket_path: path for the Unix domain socket
+        fd_map: maps "layer.module.shard" keys to file descriptors
+            e.g., {"2.self_attn.qkv_proj.k_proj": 66}
+    """
+    import json
+    import threading
+
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(8)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                break
+            try:
+                # Client sends a JSON request with the key
+                data = conn.recv(4096).decode()
+                request = json.loads(data)
+                key = request["key"]
+                if key in fd_map:
+                    send_fd(conn, fd_map[key])
+                else:
+                    conn.sendall(b"ERROR: key not found")
+            except Exception as e:
+                logger.error("fd server error: %s", e)
+            finally:
+                conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    logger.info("VMM fd server started on %s with %d fds", socket_path, len(fd_map))
+
+
+def request_fd(socket_path: str, key: str) -> int:
+    """Request a DMA-BUF fd from the owner's fd server.
+
+    Args:
+        socket_path: path to the owner's Unix domain socket
+        key: "layer.module.shard" key matching the fd_map on the server
+
+    Returns:
+        A file descriptor valid in this process.
+    """
+    import json
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(socket_path)
+    client.sendall(json.dumps({"key": key}).encode())
+    fd = recv_fd(client)
+    client.close()
+    return fd

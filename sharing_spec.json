@@ -1,0 +1,12 @@
+{
+  "owner": "model_a",
+  "socket_path": "/tmp/vmm_sharing.sock",
+  "components": [
+    {
+      "layer": 2,
+      "module": "self_attn.qkv_proj",
+      "shard_order": ["q_proj", "k_proj", "v_proj"],
+      "shared": ["k_proj"]
+    }
+  ]
+}

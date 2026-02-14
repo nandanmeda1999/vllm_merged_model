@@ -25,6 +25,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.platforms import current_platform
 
 from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary, cudaIpcMemHandle_t
+from vllm.model_executor.model_loader.vmm_utils import (
+    VMMCompositeWeight, start_fd_server, request_fd)
 import ctypes
 import cupy as cp
 import base64
@@ -265,25 +267,172 @@ class DefaultModelLoader(BaseModelLoader):
                               fall_back_to_pt=True,
                               allow_patterns_overrides=None)
 
+    def _setup_vmm_sharing(self, model: nn.Module, model_config: ModelConfig
+                           ) -> tuple[set[str], dict]:
+        """Set up VMM-based partial weight sharing.
+
+        Reads the sharing spec, pre-allocates VMM tensors, and for consumers
+        imports shared chunks from the owner via Unix socket.
+
+        The spec file uses shard_order to map checkpoint names to indices,
+        so no model-specific knowledge is needed.
+
+        Returns:
+            (skip_names, vmm_weights) where:
+            - skip_names: set of checkpoint weight name substrings to filter
+            - vmm_weights: dict mapping "layer.module" to VMMCompositeWeight
+        """
+        spec_path = model_config.shared_layers_spec_path
+        with open(spec_path) as f:
+            spec = json.load(f)
+
+        model_id = os.environ.get("VMM_MODEL_ID", "")
+        is_owner = (model_id == spec["owner"])
+        socket_path = spec.get("socket_path", "/tmp/vmm_sharing.sock")
+
+        module_map = dict(model.named_modules())
+        skip_names: set[str] = set()
+        vmm_weights: dict[str, VMMCompositeWeight] = {}
+        fd_map: dict[str, int] = {}  # for owner's fd server
+
+        for entry in spec["components"]:
+            layer = entry["layer"]
+            module_name = entry["module"]       # e.g., "self_attn.qkv_proj"
+            shard_order = entry["shard_order"]  # e.g., ["q_proj", "k_proj", "v_proj"]
+            shared_shards = entry["shared"]     # e.g., ["k_proj"]
+
+            # Map shared names to shard indices via shard_order
+            shared_indices = set()
+            for shard_name in shared_shards:
+                idx = shard_order.index(shard_name)
+                shared_indices.add(idx)
+
+            # Find the module
+            full_module_name = f"model.layers.{layer}.{module_name}"
+            module = module_map.get(full_module_name)
+            if module is None:
+                raise ValueError(f"Module {full_module_name} not found")
+
+            # Get sub-component sizes from module
+            output_sizes = module.output_sizes  # e.g., [4096, 4096, 4096]
+            weight_shape = list(module.weight.shape)  # e.g., [12288, 4096]
+            input_size = weight_shape[1]
+            dtype = module.weight.dtype
+
+            sub_sizes_bytes = [s * input_size * dtype.itemsize
+                               for s in output_sizes]
+
+            # Create VMM tensor
+            if is_owner:
+                vmm_w = VMMCompositeWeight(
+                    device=0,
+                    sub_component_sizes_bytes=sub_sizes_bytes,
+                    shape=weight_shape,
+                    dtype=dtype,
+                    exportable=True,
+                )
+            else:
+                vmm_w = VMMCompositeWeight(
+                    device=0,
+                    sub_component_sizes_bytes=sub_sizes_bytes,
+                    shape=weight_shape,
+                    dtype=dtype,
+                    exportable=False,
+                    skip_indices=shared_indices,
+                )
+                # Import shared chunks from owner
+                for shard_name in shared_shards:
+                    idx = shard_order.index(shard_name)
+                    key = f"{layer}.{module_name}.{shard_name}"
+                    fd = request_fd(socket_path, key)
+                    vmm_w.import_chunk_from_fd(idx, fd)
+                    os.close(fd)
+                vmm_w.finalize()
+
+            # Swap module weight data (preserve ModelWeightParameter + weight_loader)
+            with torch.no_grad():
+                module.weight.data = vmm_w.tensor
+
+            vmm_weights[f"{layer}.{module_name}"] = vmm_w
+
+            # Build skip set for consumer: skip shared checkpoint weights
+            # e.g., for module "self_attn.qkv_proj", shard "k_proj" at layer 2,
+            # skip weights matching "model.layers.2.self_attn.k_proj"
+            if not is_owner:
+                module_prefix = module_name.rsplit(".", 1)[0]  # "self_attn"
+                for shard_name in shared_shards:
+                    skip_names.add(
+                        f"model.layers.{layer}.{module_prefix}.{shard_name}")
+
+            logger.info("VMM %s: layer %d %s, shared=%s, indices=%s",
+                        "owner" if is_owner else "consumer",
+                        layer, module_name, shared_shards, shared_indices)
+
+        # Owner: export shared chunks and start fd server
+        if is_owner:
+            for entry in spec["components"]:
+                layer = entry["layer"]
+                module_name = entry["module"]
+                shard_order = entry["shard_order"]
+                vmm_w = vmm_weights[f"{layer}.{module_name}"]
+
+                for shard_name in entry["shared"]:
+                    idx = shard_order.index(shard_name)
+                    _pid, fd = vmm_w.export_chunk(idx)
+                    key = f"{layer}.{module_name}.{shard_name}"
+                    fd_map[key] = fd
+
+            start_fd_server(socket_path, fd_map)
+
+        return skip_names, vmm_weights
+
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
-        # print the names of the weights to load for debugging
         logger.info(f"Weights to load: {weights_to_load}")
 
-        loaded_weights = model.load_weights(
-            self.get_all_weights(model_config, model))
-        
-        lib = CudaRTLibrary()
-        lib.cudaSetDevice(0)
-        tmp = lib.cudaMalloc(1)
-        lib.cudaFree(tmp)  # ensure context exists
+        # Set up VMM sharing if spec exists
+        skip_names: set[str] = set()
+        vmm_weights: dict = {}
+        if (model_config.shared_layers_spec_path
+                and os.path.exists(model_config.shared_layers_spec_path)):
+            spec_path = model_config.shared_layers_spec_path
+            # Check if it's a VMM spec (JSON with "components" key) vs old handles.jsonl
+            with open(spec_path) as f:
+                first_char = f.read(1)
+            if first_char == '{':
+                # VMM sharing spec
+                skip_names, vmm_weights = self._setup_vmm_sharing(
+                    model, model_config)
 
-        if model_config.shared_layers_spec_path and os.path.exists(model_config.shared_layers_spec_path):
-            self.load_weight_pointers(lib, model, model_config)
+        # Get weight iterator, optionally filtered
+        weights_iter = self.get_all_weights(model_config, model)
+        if skip_names:
+            original_iter = weights_iter
+            def filtered_weights(iterator, skip):
+                for name, tensor in iterator:
+                    if any(s in name for s in skip):
+                        logger.info("VMM: skipping weight %s", name)
+                        continue
+                    yield name, tensor
+            weights_iter = filtered_weights(original_iter, skip_names)
 
-        # if model_config.shared_layers_ptrs_path:
-        #     self.store_weight_pointers(lib, model, model_config)
+        loaded_weights = model.load_weights(weights_iter)
+
+        # Existing IPC sharing (whole-module) — only if NOT using VMM
+        if not vmm_weights:
+            lib = CudaRTLibrary()
+            lib.cudaSetDevice(0)
+            tmp = lib.cudaMalloc(1)
+            lib.cudaFree(tmp)
+
+            if (model_config.shared_layers_spec_path
+                    and os.path.exists(model_config.shared_layers_spec_path)):
+                # Check if it's old-style handles.jsonl
+                with open(model_config.shared_layers_spec_path) as f:
+                    first_char = f.read(1)
+                if first_char != '{':
+                    self.load_weight_pointers(lib, model, model_config)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
