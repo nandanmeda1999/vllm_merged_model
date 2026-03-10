@@ -24,7 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator, safetensors_weights_iterator)
 from vllm.platforms import current_platform
 
-from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary, cudaIpcMemHandle_t
+from vllm.distributed.device_communicators.cuda_wrapper import CudaDriverLibrary, CudaRTLibrary, cudaIpcMemHandle_t
 from vllm.model_executor.model_loader.vmm_utils import (
     VMMCompositeWeight, start_fd_server, request_fd)
 import ctypes
@@ -267,124 +267,338 @@ class DefaultModelLoader(BaseModelLoader):
                               fall_back_to_pt=True,
                               allow_patterns_overrides=None)
 
-    def _setup_vmm_sharing(self, model: nn.Module, model_config: ModelConfig
-                           ) -> tuple[set[str], dict]:
-        """Set up VMM-based partial weight sharing.
-
-        Reads the sharing spec, pre-allocates VMM tensors, and for consumers
-        imports shared chunks from the owner via Unix socket.
-
-        The spec file uses shard_order to map checkpoint names to indices,
-        so no model-specific knowledge is needed.
-
-        Returns:
-            (skip_names, vmm_weights) where:
-            - skip_names: set of checkpoint weight name substrings to filter
-            - vmm_weights: dict mapping "layer.module" to VMMCompositeWeight
-        """
+    def _setup_vmm_sharing(self, model: nn.Module, model_config: ModelConfig):
         spec_path = model_config.shared_layers_spec_path
+        handles_path = model_config.shared_layers_ptrs_path
+        model_id = os.path.basename(os.path.normpath(model_config.model))
+
+        drv = CudaDriverLibrary()
+        my_physical_device = drv.get_physical_device()
+
         with open(spec_path) as f:
             spec = json.load(f)
 
-        model_id = os.environ.get("VMM_MODEL_ID", "")
-        is_owner = (model_id == spec["owner"])
-        socket_path = spec.get("socket_path", "/tmp/vmm_sharing.sock")
+        handles = {}
+        if os.path.exists(handles_path):
+            with open(handles_path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    for model_name, info in entry.items():
+                        if info.get("physical_device") == my_physical_device:
+                            handles[model_name] = info
 
         module_map = dict(model.named_modules())
         skip_names: set[str] = set()
         vmm_weights: dict[str, VMMCompositeWeight] = {}
-        fd_map: dict[str, int] = {}  # for owner's fd server
+        my_export_components = []
+        fd_map: dict[str, int] = {}
+        socket_path = os.environ.get("VMM_SOCKET_PATH", "")
+        if socket_path == "":
+            raise ValueError("VMM_SOCKET_PATH environment variable is not set")
+        if not os.path.exists(socket_path):
+            raise ValueError(f"Socket path {socket_path} does not exist")
+        socket_path = os.path.join(socket_path, f"vmm_{os.getpid()}.sock")
 
-        for entry in spec["components"]:
-            layer = entry["layer"]
-            module_name = entry["module"]       # e.g., "self_attn.qkv_proj"
-            shard_order = entry["shard_order"]  # e.g., ["q_proj", "k_proj", "v_proj"]
-            shared_shards = entry["shared"]     # e.g., ["k_proj"]
+        def resolve_component(component):
+            """ Map high-level component to module/shard info"""
 
-            # Map shared names to shard indices via shard_order
+            if component.startswith("self_attn.") and component.split(".")[1] in (
+                "q_proj", "k_proj", "v_proj"
+            ):
+                shard = component.split(".")[1]
+                return "self_attn.qkv_proj", ["q_proj", "k_proj", "v_proj"], [shard]
+
+            if component.startswith("mlp.") and component.split(".")[1] in (
+                "gate_proj", "up_proj"
+            ):
+                shard = component.split(".")[1]
+                return "mlp.gate_up_proj", ["gate_proj", "up_proj"], [shard]
+
+            if component == "self_attn.o_proj":
+                return "self_attn.o_proj", ["o_proj"], ["o_proj"]
+
+            if component == "mlp.down_proj":
+                return "mlp.down_proj", ["down_proj"], ["down_proj"]
+
+            raise ValueError(f"Unknown component {component}")
+        
+
+        def model_exports_component(handles, model_name, layer,
+                             module_name, shared_shards):
+            """Check if a model has exported the required component."""
+
+            info = handles.get(model_name)
+            if not info:
+                return False
+
+            for comp in info.get("components", []):
+                if comp["layer"] != layer:
+                    continue
+                if comp["module"] != module_name:
+                    continue
+
+                if any(s in comp.get("shared", []) for s in shared_shards):
+                    return True
+
+            return False
+
+        for group in spec:
+            if len(group) == 1:
+                continue
+
+            mine = next((e for e in group if e["model"] == model_id), None)
+            if not mine:
+                continue
+
+            layer = mine["layer"]
+            component = mine["component"]
+
+            module_name, shard_order, shared_shards = resolve_component(component)
+
             shared_indices = set()
             for shard_name in shared_shards:
                 idx = shard_order.index(shard_name)
                 shared_indices.add(idx)
 
-            # Find the module
             full_module_name = f"model.layers.{layer}.{module_name}"
             module = module_map.get(full_module_name)
             if module is None:
                 raise ValueError(f"Module {full_module_name} not found")
-
-            # Get sub-component sizes from module
-            output_sizes = module.output_sizes  # e.g., [4096, 4096, 4096]
-            weight_shape = list(module.weight.shape)  # e.g., [12288, 4096]
+                        
+            weight_shape = list(module.weight.shape)
             input_size = weight_shape[1]
+            if hasattr(module, "output_sizes"):
+                # fused projections like qkv_proj, gate_up_proj
+                output_sizes = module.output_sizes
+            else:
+                # single projection layer
+                output_sizes = [weight_shape[0]]
             dtype = module.weight.dtype
 
             sub_sizes_bytes = [s * input_size * dtype.itemsize
                                for s in output_sizes]
 
-            # Create VMM tensor
-            if is_owner:
-                vmm_w = VMMCompositeWeight(
-                    device=0,
-                    sub_component_sizes_bytes=sub_sizes_bytes,
-                    shape=weight_shape,
-                    dtype=dtype,
-                    exportable=True,
-                )
-            else:
-                vmm_w = VMMCompositeWeight(
-                    device=0,
-                    sub_component_sizes_bytes=sub_sizes_bytes,
-                    shape=weight_shape,
-                    dtype=dtype,
-                    exportable=False,
-                    skip_indices=shared_indices,
-                )
-                # Import shared chunks from owner
+            owner_socket = None
+            owner_model = None
+
+            for other in group:
+                if other["model"] == model_id:
+                    continue
+
+                other_model = other["model"]
+                other_layer = other["layer"]
+                other_component = other["component"]
+
+                other_module_name, other_shard_order, other_shards = resolve_component(other_component)
+
+                assert len(other_shards) == 1, "Currently only support one shared shard per component"
+
+                if model_exports_component(handles, other_model, other_layer, other_module_name, other_shards):
+                    owner_socket = handles[other_model]["socket"]
+                    owner_model = other_model
+                    break
+
+            vmm_weights_key = f"{layer}.{module_name}"
+
+            # Consumer path
+            if owner_socket:
+                if vmm_weights_key in vmm_weights:
+                    vmm_w = vmm_weights[vmm_weights_key]
+                    logger.info("Reusing existing VMM weight for layer %d %s ", layer, module_name)
+                else:
+                    vmm_w = VMMCompositeWeight(
+                        device=0,
+                        sub_component_sizes_bytes=sub_sizes_bytes,
+                        shape=weight_shape,
+                        dtype=dtype,
+                        exportable=True,
+                        skip_indices=shared_indices,
+                    )
+
                 for shard_name in shared_shards:
                     idx = shard_order.index(shard_name)
-                    key = f"{layer}.{module_name}.{shard_name}"
-                    fd = request_fd(socket_path, key)
+                    key = f"{other_layer}.{other_module_name}.{other_shards[0]}"
+                    fd = request_fd(owner_socket, key)
                     vmm_w.import_chunk_from_fd(idx, fd)
                     os.close(fd)
-                vmm_w.finalize()
+                vmm_w.finalize() 
 
-            # Swap module weight data (preserve ModelWeightParameter + weight_loader)
+                skip_names.add(
+                    f"model.layers.{layer}.{component}"
+                )
+
+            # Owner path
+            else:
+                if vmm_weights_key in vmm_weights:
+                    vmm_w = vmm_weights[vmm_weights_key]
+                    logger.info("Reusing existing VMM weight for layer %d %s", layer, module_name)
+                else:
+                    vmm_w = VMMCompositeWeight(
+                        device=0,
+                        sub_component_sizes_bytes=sub_sizes_bytes,
+                        shape=weight_shape,
+                        dtype=dtype,
+                        exportable=True,
+                    )
+                
+                for shard in shared_shards:
+                    idx = shard_order.index(shard)
+                    _, fd = vmm_w.export_chunk(idx)
+                    key = f"{layer}.{module_name}.{shard}"
+                    fd_map[key] = fd
+
+                my_export_components.append({
+                    "layer": layer,
+                    "module": module_name,
+                    "shard_order": shard_order,
+                    "shared": shared_shards,
+                })
+
             with torch.no_grad():
                 module.weight.data = vmm_w.tensor
 
-            vmm_weights[f"{layer}.{module_name}"] = vmm_w
-
-            # Build skip set for consumer: skip shared checkpoint weights
-            # e.g., for module "self_attn.qkv_proj", shard "k_proj" at layer 2,
-            # skip weights matching "model.layers.2.self_attn.k_proj"
-            if not is_owner:
-                module_prefix = module_name.rsplit(".", 1)[0]  # "self_attn"
-                for shard_name in shared_shards:
-                    skip_names.add(
-                        f"model.layers.{layer}.{module_prefix}.{shard_name}")
+            vmm_weights[vmm_weights_key] = vmm_w
 
             logger.info("VMM %s: layer %d %s, shared=%s, indices=%s",
-                        "owner" if is_owner else "consumer",
+                        "consumer" if owner_socket else "owner",
                         layer, module_name, shared_shards, shared_indices)
 
-        # Owner: export shared chunks and start fd server
-        if is_owner:
-            for entry in spec["components"]:
-                layer = entry["layer"]
-                module_name = entry["module"]
-                shard_order = entry["shard_order"]
-                vmm_w = vmm_weights[f"{layer}.{module_name}"]
-
-                for shard_name in entry["shared"]:
-                    idx = shard_order.index(shard_name)
-                    _pid, fd = vmm_w.export_chunk(idx)
-                    key = f"{layer}.{module_name}.{shard_name}"
-                    fd_map[key] = fd
-
+        if fd_map:
             start_fd_server(socket_path, fd_map)
 
+            with open(handles_path, "a") as f:
+                json.dump({
+                    model_id: {
+                        "socket": socket_path,
+                        "physical_device": my_physical_device,
+                        "components": my_export_components,
+                    }
+                }, f)
+                f.write("\n")
+
         return skip_names, vmm_weights
+
+
+    # def _setup_vmm_sharing_old(self, model: nn.Module, model_config: ModelConfig
+    #                        ) -> tuple[set[str], dict]:
+    #     """Set up VMM-based partial weight sharing.
+
+    #     Reads the sharing spec, pre-allocates VMM tensors, and for consumers
+    #     imports shared chunks from the owner via Unix socket.
+
+    #     The spec file uses shard_order to map checkpoint names to indices,
+    #     so no model-specific knowledge is needed.
+
+    #     Returns:
+    #         (skip_names, vmm_weights) where:
+    #         - skip_names: set of checkpoint weight name substrings to filter
+    #         - vmm_weights: dict mapping "layer.module" to VMMCompositeWeight
+    #     """
+    #     spec_path = model_config.shared_layers_spec_path
+    #     with open(spec_path) as f:
+    #         spec = json.load(f)
+
+    #     model_id = os.environ.get("VMM_MODEL_ID", "")
+    #     is_owner = (model_id == spec["owner"])
+    #     socket_path = spec.get("socket_path", "/tmp/vmm_sharing.sock")
+
+    #     module_map = dict(model.named_modules())
+    #     skip_names: set[str] = set()
+    #     vmm_weights: dict[str, VMMCompositeWeight] = {}
+    #     fd_map: dict[str, int] = {}  # for owner's fd server
+
+    #     for entry in spec["components"]:
+    #         layer = entry["layer"]
+    #         module_name = entry["module"]       # e.g., "self_attn.qkv_proj"
+    #         shard_order = entry["shard_order"]  # e.g., ["q_proj", "k_proj", "v_proj"]
+    #         shared_shards = entry["shared"]     # e.g., ["k_proj"]
+
+    #         # Map shared names to shard indices via shard_order
+    #         shared_indices = set()
+    #         for shard_name in shared_shards:
+    #             idx = shard_order.index(shard_name)
+    #             shared_indices.add(idx)
+
+    #         # Find the module
+    #         full_module_name = f"model.layers.{layer}.{module_name}"
+    #         module = module_map.get(full_module_name)
+    #         if module is None:
+    #             raise ValueError(f"Module {full_module_name} not found")
+
+    #         # Get sub-component sizes from module
+    #         output_sizes = module.output_sizes  # e.g., [4096, 4096, 4096]
+    #         weight_shape = list(module.weight.shape)  # e.g., [12288, 4096]
+    #         input_size = weight_shape[1]
+    #         dtype = module.weight.dtype
+
+    #         sub_sizes_bytes = [s * input_size * dtype.itemsize
+    #                            for s in output_sizes]
+
+    #         # Create VMM tensor
+    #         if is_owner:
+    #             vmm_w = VMMCompositeWeight(
+    #                 device=0,
+    #                 sub_component_sizes_bytes=sub_sizes_bytes,
+    #                 shape=weight_shape,
+    #                 dtype=dtype,
+    #                 exportable=True,
+    #             )
+    #         else:
+    #             vmm_w = VMMCompositeWeight(
+    #                 device=0,
+    #                 sub_component_sizes_bytes=sub_sizes_bytes,
+    #                 shape=weight_shape,
+    #                 dtype=dtype,
+    #                 exportable=False,
+    #                 skip_indices=shared_indices,
+    #             )
+    #             # Import shared chunks from owner
+    #             for shard_name in shared_shards:
+    #                 idx = shard_order.index(shard_name)
+    #                 key = f"{layer}.{module_name}.{shard_name}"
+    #                 fd = request_fd(socket_path, key)
+    #                 vmm_w.import_chunk_from_fd(idx, fd)
+    #                 os.close(fd)
+    #             vmm_w.finalize()
+
+    #         # Swap module weight data (preserve ModelWeightParameter + weight_loader)
+    #         with torch.no_grad():
+    #             module.weight.data = vmm_w.tensor
+
+    #         vmm_weights[f"{layer}.{module_name}"] = vmm_w
+
+    #         # Build skip set for consumer: skip shared checkpoint weights
+    #         # e.g., for module "self_attn.qkv_proj", shard "k_proj" at layer 2,
+    #         # skip weights matching "model.layers.2.self_attn.k_proj"
+    #         if not is_owner:
+    #             module_prefix = module_name.rsplit(".", 1)[0]  # "self_attn"
+    #             for shard_name in shared_shards:
+    #                 skip_names.add(
+    #                     f"model.layers.{layer}.{module_prefix}.{shard_name}")
+
+    #         logger.info("VMM %s: layer %d %s, shared=%s, indices=%s",
+    #                     "owner" if is_owner else "consumer",
+    #                     layer, module_name, shared_shards, shared_indices)
+
+    #     # Owner: export shared chunks and start fd server
+    #     if is_owner:
+    #         for entry in spec["components"]:
+    #             layer = entry["layer"]
+    #             module_name = entry["module"]
+    #             shard_order = entry["shard_order"]
+    #             vmm_w = vmm_weights[f"{layer}.{module_name}"]
+
+    #             for shard_name in entry["shared"]:
+    #                 idx = shard_order.index(shard_name)
+    #                 _pid, fd = vmm_w.export_chunk(idx)
+    #                 key = f"{layer}.{module_name}.{shard_name}"
+    #                 fd_map[key] = fd
+
+    #         start_fd_server(socket_path, fd_map)
+
+    #     return skip_names, vmm_weights
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
@@ -397,13 +611,8 @@ class DefaultModelLoader(BaseModelLoader):
         if (model_config.shared_layers_spec_path
                 and os.path.exists(model_config.shared_layers_spec_path)):
             spec_path = model_config.shared_layers_spec_path
-            # Check if it's a VMM spec (JSON with "components" key) vs old handles.jsonl
-            with open(spec_path) as f:
-                first_char = f.read(1)
-            if first_char == '{':
-                # VMM sharing spec
-                skip_names, vmm_weights = self._setup_vmm_sharing(
-                    model, model_config)
+            skip_names, vmm_weights = self._setup_vmm_sharing(
+                model, model_config)
 
         # Get weight iterator, optionally filtered
         weights_iter = self.get_all_weights(model_config, model)
@@ -443,9 +652,41 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
+            filtered_not_loaded = set()
+
+            for w in weights_not_loaded:
+                # Extract layer prefix. e.g. model.layers.2.self_attn
+                prefix, name, param = w.rsplit(".", 2)
+
+                if name in {"o_proj", "down_proj"}:
+                    if f"{prefix}.{name}" not in skip_names:
+                        filtered_not_loaded.add(w)
+                    continue
+
+                if name == "qkv_proj":
+                    shards = [
+                        f"{prefix}.q_proj",
+                        f"{prefix}.k_proj",
+                        f"{prefix}.v_proj",
+                    ]
+                    if not all(s in skip_names for s in shards):
+                        filtered_not_loaded.add(w)
+                    continue
+
+                if name == "gate_up_proj":
+                    shards = [
+                        f"{prefix}.gate_proj",
+                        f"{prefix}.up_proj",
+                    ]
+                    if not all(s in skip_names for s in shards):
+                        filtered_not_loaded.add(w)
+                    continue
+
+                filtered_not_loaded.add(w)
+
+            if filtered_not_loaded:
                 raise ValueError("Following weights were not initialized from "
-                                 f"checkpoint: {weights_not_loaded}")
+                                 f"checkpoint: {filtered_not_loaded}")
 
     def store_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
         model_name = model_config.model

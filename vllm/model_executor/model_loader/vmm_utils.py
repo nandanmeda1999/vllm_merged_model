@@ -134,7 +134,7 @@ class VMMCompositeWeight:
         ptr = cp.cuda.MemoryPointer(mem, 0)
         cupy_arr = cp.ndarray(self.shape, dtype=cp_dtype, memptr=ptr)
 
-        tensor = torch.as_tensor(cupy_arr, device=f"cuda:{self.device}")
+        tensor = torch.as_tensor(cupy_arr, device=f"cuda:{self.physical_device}")
         if self.dtype == torch.bfloat16:
             tensor = tensor.view(torch.bfloat16)
         return tensor
