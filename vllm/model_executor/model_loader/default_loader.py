@@ -459,6 +459,8 @@ class DefaultModelLoader(BaseModelLoader):
             with torch.no_grad():
                 module.weight.data = vmm_w.tensor
 
+            torch.cuda.empty_cache()
+
             vmm_weights[vmm_weights_key] = vmm_w
 
             logger.info("VMM %s: layer %d %s, shared=%s, indices=%s",
@@ -479,126 +481,6 @@ class DefaultModelLoader(BaseModelLoader):
                 f.write("\n")
 
         return skip_names, vmm_weights
-
-
-    # def _setup_vmm_sharing_old(self, model: nn.Module, model_config: ModelConfig
-    #                        ) -> tuple[set[str], dict]:
-    #     """Set up VMM-based partial weight sharing.
-
-    #     Reads the sharing spec, pre-allocates VMM tensors, and for consumers
-    #     imports shared chunks from the owner via Unix socket.
-
-    #     The spec file uses shard_order to map checkpoint names to indices,
-    #     so no model-specific knowledge is needed.
-
-    #     Returns:
-    #         (skip_names, vmm_weights) where:
-    #         - skip_names: set of checkpoint weight name substrings to filter
-    #         - vmm_weights: dict mapping "layer.module" to VMMCompositeWeight
-    #     """
-    #     spec_path = model_config.shared_layers_spec_path
-    #     with open(spec_path) as f:
-    #         spec = json.load(f)
-
-    #     model_id = os.environ.get("VMM_MODEL_ID", "")
-    #     is_owner = (model_id == spec["owner"])
-    #     socket_path = spec.get("socket_path", "/tmp/vmm_sharing.sock")
-
-    #     module_map = dict(model.named_modules())
-    #     skip_names: set[str] = set()
-    #     vmm_weights: dict[str, VMMCompositeWeight] = {}
-    #     fd_map: dict[str, int] = {}  # for owner's fd server
-
-    #     for entry in spec["components"]:
-    #         layer = entry["layer"]
-    #         module_name = entry["module"]       # e.g., "self_attn.qkv_proj"
-    #         shard_order = entry["shard_order"]  # e.g., ["q_proj", "k_proj", "v_proj"]
-    #         shared_shards = entry["shared"]     # e.g., ["k_proj"]
-
-    #         # Map shared names to shard indices via shard_order
-    #         shared_indices = set()
-    #         for shard_name in shared_shards:
-    #             idx = shard_order.index(shard_name)
-    #             shared_indices.add(idx)
-
-    #         # Find the module
-    #         full_module_name = f"model.layers.{layer}.{module_name}"
-    #         module = module_map.get(full_module_name)
-    #         if module is None:
-    #             raise ValueError(f"Module {full_module_name} not found")
-
-    #         # Get sub-component sizes from module
-    #         output_sizes = module.output_sizes  # e.g., [4096, 4096, 4096]
-    #         weight_shape = list(module.weight.shape)  # e.g., [12288, 4096]
-    #         input_size = weight_shape[1]
-    #         dtype = module.weight.dtype
-
-    #         sub_sizes_bytes = [s * input_size * dtype.itemsize
-    #                            for s in output_sizes]
-
-    #         # Create VMM tensor
-    #         if is_owner:
-    #             vmm_w = VMMCompositeWeight(
-    #                 device=0,
-    #                 sub_component_sizes_bytes=sub_sizes_bytes,
-    #                 shape=weight_shape,
-    #                 dtype=dtype,
-    #                 exportable=True,
-    #             )
-    #         else:
-    #             vmm_w = VMMCompositeWeight(
-    #                 device=0,
-    #                 sub_component_sizes_bytes=sub_sizes_bytes,
-    #                 shape=weight_shape,
-    #                 dtype=dtype,
-    #                 exportable=False,
-    #                 skip_indices=shared_indices,
-    #             )
-    #             # Import shared chunks from owner
-    #             for shard_name in shared_shards:
-    #                 idx = shard_order.index(shard_name)
-    #                 key = f"{layer}.{module_name}.{shard_name}"
-    #                 fd = request_fd(socket_path, key)
-    #                 vmm_w.import_chunk_from_fd(idx, fd)
-    #                 os.close(fd)
-    #             vmm_w.finalize()
-
-    #         # Swap module weight data (preserve ModelWeightParameter + weight_loader)
-    #         with torch.no_grad():
-    #             module.weight.data = vmm_w.tensor
-
-    #         vmm_weights[f"{layer}.{module_name}"] = vmm_w
-
-    #         # Build skip set for consumer: skip shared checkpoint weights
-    #         # e.g., for module "self_attn.qkv_proj", shard "k_proj" at layer 2,
-    #         # skip weights matching "model.layers.2.self_attn.k_proj"
-    #         if not is_owner:
-    #             module_prefix = module_name.rsplit(".", 1)[0]  # "self_attn"
-    #             for shard_name in shared_shards:
-    #                 skip_names.add(
-    #                     f"model.layers.{layer}.{module_prefix}.{shard_name}")
-
-    #         logger.info("VMM %s: layer %d %s, shared=%s, indices=%s",
-    #                     "owner" if is_owner else "consumer",
-    #                     layer, module_name, shared_shards, shared_indices)
-
-    #     # Owner: export shared chunks and start fd server
-    #     if is_owner:
-    #         for entry in spec["components"]:
-    #             layer = entry["layer"]
-    #             module_name = entry["module"]
-    #             shard_order = entry["shard_order"]
-    #             vmm_w = vmm_weights[f"{layer}.{module_name}"]
-
-    #             for shard_name in entry["shared"]:
-    #                 idx = shard_order.index(shard_name)
-    #                 _pid, fd = vmm_w.export_chunk(idx)
-    #                 key = f"{layer}.{module_name}.{shard_name}"
-    #                 fd_map[key] = fd
-
-    #         start_fd_server(socket_path, fd_map)
-
-    #     return skip_names, vmm_weights
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
@@ -626,22 +508,8 @@ class DefaultModelLoader(BaseModelLoader):
                     yield name, tensor
             weights_iter = filtered_weights(original_iter, skip_names)
 
+        # torch.cuda.empty_cache()
         loaded_weights = model.load_weights(weights_iter)
-
-        # Existing IPC sharing (whole-module) — only if NOT using VMM
-        if not vmm_weights:
-            lib = CudaRTLibrary()
-            lib.cudaSetDevice(0)
-            tmp = lib.cudaMalloc(1)
-            lib.cudaFree(tmp)
-
-            if (model_config.shared_layers_spec_path
-                    and os.path.exists(model_config.shared_layers_spec_path)):
-                # Check if it's old-style handles.jsonl
-                with open(model_config.shared_layers_spec_path) as f:
-                    first_char = f.read(1)
-                if first_char != '{':
-                    self.load_weight_pointers(lib, model, model_config)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
@@ -687,101 +555,3 @@ class DefaultModelLoader(BaseModelLoader):
             if filtered_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {filtered_not_loaded}")
-
-    def store_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
-        model_name = model_config.model
-
-        for param_name, param in model.named_parameters():
-            # Parse layer + component
-            # Example: model.layers.1.self_attn.qkv_proj.weight
-            print(param_name)
-            m = re.match(r"model\.layers\.(\d+)\.(.+)\.weight", param_name)
-            if not m:
-                # raise ValueError(f"Unrecognized parameter format: {param_name}")
-                continue
-
-            layer_idx = int(m.group(1))
-            component = m.group(2)
-
-            ALLOWED_COMPONENTS = (
-                "self_attn.qkv_proj",
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.o_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-                "mlp.gate_proj",
-                "mlp.gate_up_proj",
-            )
-
-            if component not in ALLOWED_COMPONENTS:
-                continue
-
-            handle = lib.cudaIpcGetMemHandle(param.data_ptr())
-            handle_bytes = ctypes.string_at(ctypes.addressof(handle), 128)
-            handle_b64 = base64.b64encode(handle_bytes).decode("ascii")
-
-            record = {
-                "model_name": model_name,
-                "layer": layer_idx,
-                "component": component,
-                "handle": handle_b64,
-                "shape": list(param.shape),
-                "dtype": str(param.dtype),
-            }
-
-            with open(model_config.shared_layers_ptrs_path, "a") as f:
-                f.write(json.dumps(record) + "\n")
-
-    def load_weight_pointers(self, lib, model: nn.Module, model_config: ModelConfig) -> None:
-        module_map = dict(model.named_modules())
-
-        with open(model_config.shared_layers_ptrs_path, "r") as f:
-            for line in f:
-                rec = json.loads(line)
-                layer = rec["layer"]
-                component = rec["component"]
-                shape = torch.Size(rec["shape"])
-                dtype = getattr(torch, rec["dtype"].split(".")[-1])
-                handle_bytes = base64.b64decode(rec["handle"])
-
-                module_name = f"model.layers.{layer}.{component}"
-                module = module_map[module_name]
-
-                self.load_ipc_param_into_module(lib, module, handle_bytes, shape, dtype)
-
-    @torch._dynamo.disable
-    def load_ipc_param_into_module(self, lib, module, handle_bytes, shape, dtype, device="cuda:0"):
-        """Replace a module's parameter with a tensor backed by a CUDA IPC pointer."""
-
-        lib = CudaRTLibrary()
-        lib.cudaSetDevice(0)
-        # ---- 1. Decode handle ----
-        handle = cudaIpcMemHandle_t.from_buffer_copy(handle_bytes)
-        pointer = lib.cudaIpcOpenMemHandle(handle)
-        if pointer is None or pointer.value == 0:
-            raise RuntimeError("cudaIpcOpenMemHandle failed")
-
-        # ---- 2. Build CuPy array from raw pointer ----
-        cp_dtype = {
-            torch.float16: cp.float16,
-            torch.bfloat16: cp.uint16,
-            torch.float32: cp.float32,
-            torch.int8: cp.int8,
-        }[dtype]
-
-        nbytes = cp.dtype(cp_dtype).itemsize * int(cp.prod(cp.asarray(shape)))
-
-        mem = cp.cuda.UnownedMemory(pointer.value, nbytes, owner=None)
-        ptr = cp.cuda.MemoryPointer(mem, 0)
-        cupy_arr = cp.ndarray(shape, dtype=cp_dtype, memptr=ptr)
-
-        # ---- 3. Convert to Torch tensor *outside* Dynamo ----
-        torch_arr = torch.as_tensor(cupy_arr, device=device)
-        if dtype == torch.bfloat16:
-            torch_arr = torch_arr.view(torch.bfloat16)
-
-        # ---- 4. Replace the parameter on the module ----
-        with torch.no_grad():
-            setattr(module, "weight", torch.nn.Parameter(torch_arr))
