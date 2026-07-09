@@ -506,6 +506,9 @@ RUN mv vllm src/vllm
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
+ARG INSTALL_KVCACHED=false
+ARG KVCACHED_GIT_REPO="https://github.com/ovg-project/kvcached.git"
+ARG KVCACHED_GIT_REF=""
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -527,6 +530,21 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         BITSANDBYTES_VERSION="0.46.1"; \
     fi; \
     uv pip install --system accelerate hf_transfer modelscope "bitsandbytes>=${BITSANDBYTES_VERSION}" 'timm>=1.0.17' boto3 runai-model-streamer runai-model-streamer[s3]
+
+# kvcached's source install uses an editable install, so keep the checkout in
+# the final image at a stable path instead of deleting it after installation.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$INSTALL_KVCACHED" = "true" ]; then \
+        if [ -z "$KVCACHED_GIT_REF" ]; then \
+            echo "KVCACHED_GIT_REF must be set when INSTALL_KVCACHED=true" >&2; \
+            exit 1; \
+        fi; \
+        git clone "${KVCACHED_GIT_REPO}" /opt/kvcached \
+        && git -C /opt/kvcached checkout "${KVCACHED_GIT_REF}" \
+        && cd /opt/kvcached \
+        && uv pip install --system --no-build-isolation --no-cache-dir -e . \
+        && python3 tools/dev_copy_pth.py; \
+    fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
 
