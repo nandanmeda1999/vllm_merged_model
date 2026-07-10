@@ -7,8 +7,8 @@ requests >= 2.26.0
 tqdm
 blake3
 py-cpuinfo
-transformers >= 4.55.2
-tokenizers >= 0.21.1  # Required for fast incremental detokenization.
+transformers==4.57.3
+tokenizers==0.22.1  # Required for fast incremental detokenization.
 protobuf # Required by LlamaTokenizer.
 fastapi[standard] >= 0.115.0 # Required by FastAPI's form models in the OpenAI API server's audio transcriptions endpoint.
 aiohttp
@@ -49,3 +49,6 @@ pybase64 # fast base64 implementation
 cbor2 # Required for cross-language serialization of hashable objects
 setproctitle # Used to set process names for better debugging and monitoring
 openai-harmony >= 0.0.3  # Required for gpt-oss
+huggingface-hub==0.36.0 
+safetensors==0.7.0
+matplotlib==3.10.7

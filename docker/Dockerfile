@@ -187,6 +187,8 @@ ARG SCCACHE_S3_NO_CREDENTIALS=0
 # Flag to control whether to use pre-built vLLM wheels
 ARG VLLM_USE_PRECOMPILED=""
 ARG VLLM_MAIN_CUDA_VERSION=""
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION=""
+ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
 
 # if USE_SCCACHE is set, use sccache to speed up compilation
 RUN --mount=type=cache,target=/root/.cache/uv \
