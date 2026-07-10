@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-source /nethome/nmeda6/vllm_venv2/bin/activate
+# source vllm_venv2/bin/activate
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -118,7 +118,7 @@ run_benchmarks_for_all_targets sandhi
 
 stop_servers
 
-python "$SCRIPT_DIR/parse_and_plot_results.py" \
+python3 "$SCRIPT_DIR/parse_and_plot_results.py" \
     --bench-log-dir "$BENCH_LOG_DIR" \
     --output-dir "$RESULTS_DIR"
 
