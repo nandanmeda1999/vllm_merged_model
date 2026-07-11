@@ -271,6 +271,7 @@ class DefaultModelLoader(BaseModelLoader):
         spec_path = model_config.shared_layers_spec_path
         handles_path = model_config.shared_layers_ptrs_path
         model_id = os.path.basename(os.path.normpath(model_config.model))
+        model_id = re.sub(r"_line\d+$", "", model_id)
 
         drv = CudaDriverLibrary()
         my_physical_device = drv.get_physical_device()
@@ -304,7 +305,7 @@ class DefaultModelLoader(BaseModelLoader):
         def resolve_component(component):
             """ Map high-level component to module/shard info"""
 
-            if component.startswith("self_attn.") and component.split(".")[1] in (
+            if (component.startswith("self_attn.") or component.startswith("attn.")) and component.split(".")[1] in (
                 "q_proj", "k_proj", "v_proj"
             ):
                 shard = component.split(".")[1]
@@ -316,7 +317,7 @@ class DefaultModelLoader(BaseModelLoader):
                 shard = component.split(".")[1]
                 return "mlp.gate_up_proj", ["gate_proj", "up_proj"], [shard]
 
-            if component == "self_attn.o_proj":
+            if component == "self_attn.o_proj" or component == "attn.o_proj":
                 return "self_attn.o_proj", ["o_proj"], ["o_proj"]
 
             if component == "mlp.down_proj":
