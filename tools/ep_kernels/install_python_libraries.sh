@@ -11,7 +11,8 @@ if [ ! -d "$WORKSPACE" ]; then
 fi
 
 # install dependencies if not installed
-pip3 install cmake torch ninja
+pip3 install cmake==4.3.4
+pip3 install torch ninja
 
 # build nvshmem
 pushd $WORKSPACE
