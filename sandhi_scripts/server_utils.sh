@@ -70,6 +70,7 @@ start_servers() {
 }
 
 stop_servers() {
+    local PID=""
 
     echo "Stopping servers..."
 
@@ -79,7 +80,10 @@ stop_servers() {
         fi
     done
 
-    wait
+    for PID in "${PIDS[@]}"; do
+        wait "$PID" 2>/dev/null || true
+    done
+
     PIDS=()
 
     echo "All servers stopped."
