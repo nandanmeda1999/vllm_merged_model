@@ -67,8 +67,52 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VMM_SOCKET_PATH="$RUN_BASE_DIR/vmm_sockets"
 
 SHARED_HANDLES="$RUN_BASE_DIR/handles.jsonl"
+GPU_ALLOC_PIDS=()
+
+start_gpu_allocators() {
+    local alloc_gib="${GPU_ALLOC_GIB:-}"
+    local gpu=""
+
+    if [[ -z "$alloc_gib" ]]; then
+        return 0
+    fi
+
+    if ! [[ "$alloc_gib" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+        echo "GPU_ALLOC_GIB must be a non-negative number, got: $alloc_gib"
+        exit 1
+    fi
+
+    if ! awk "BEGIN { exit !($alloc_gib > 0) }"; then
+        return 0
+    fi
+
+    IFS=',' read -r -a gpu_list <<< "$CUDA_DEVICES"
+    for gpu in "${gpu_list[@]}"; do
+        gpu="${gpu//[[:space:]]/}"
+        if [[ -z "$gpu" ]]; then
+            continue
+        fi
+
+        CUDA_VISIBLE_DEVICES="$gpu" python3 "$SCRIPT_DIR/gpu_alloc.py" "$alloc_gib" &
+        GPU_ALLOC_PIDS+=("$!")
+    done
+}
+
+stop_gpu_allocators() {
+    local pid=""
+
+    for pid in "${GPU_ALLOC_PIDS[@]:-}"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+
+    GPU_ALLOC_PIDS=()
+}
 
 cleanup() {
+    stop_gpu_allocators || true
     stop_servers || true
     rm -f "$SHARED_HANDLES"
     rm -rf "$VMM_SOCKET_PATH"
@@ -79,6 +123,8 @@ trap cleanup EXIT
 rm -f "$SHARED_HANDLES"
 rm -rf "$VMM_SOCKET_PATH"
 mkdir -p "$VMM_SOCKET_PATH"
+
+start_gpu_allocators
 
 if [[ ${#BENCH_TARGETS[@]} -eq 0 ]]; then
     echo "BENCH_TARGETS must contain at least one benchmark target."
