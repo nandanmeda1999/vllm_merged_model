@@ -6,21 +6,19 @@
 
 CUDA_DEVICES="0"
 TENSOR_PARALLEL_SIZE=1
-GPU_ALLOC_GIB=20
+GPU_ALLOC_GIB=100
+MAX_NUM_SEQS="256"
 
 declare -A MODELS=(
-  [12301]="TsinghuaC3I/Llama-3-8B-UltraMedical"
-  [12302]="HiTZ/Llama-3.1-8B-Instruct-multi-truth-judge"
-  [12303]="K-intelligence/Llama-SafetyGuard-Content-Binary"
-  [12304]="MaziyarPanahi/calme-2.3-legalkit-8b"
-  [12305]="us4/fin-llama3.1-8b"
+  [12301]="deepseek-ai/deepseek-coder-7b-instruct-v1.5"
+  [12302]="deepseek-ai/deepseek-math-7b-instruct"
 )
 
 ############################
 # Sharing configuration
 ############################
 
-SHARED_SPEC="llama_merged_spec_up_to_cutoff.json"
+SHARED_SPEC="ds_merged_spec_up_to_cutoff.json"
 
 ############################
 # Benchmark configuration
@@ -28,9 +26,9 @@ SHARED_SPEC="llama_merged_spec_up_to_cutoff.json"
 
 BENCH_TARGETS=(default)
 
-BENCH_MODEL_default="TsinghuaC3I/Llama-3-8B-UltraMedical"
-REQUEST_RATES_default=(20 25 50 75)
-NUM_PROMPTS_default=750
+BENCH_MODEL_default="deepseek-ai/deepseek-coder-7b-instruct-v1.5"
+REQUEST_RATES_default=(1 2 3 5 7 10)
+NUM_PROMPTS_default=150
 INPUT_LEN_default=100
 OUTPUT_LEN_default=900
 
