@@ -5,6 +5,7 @@ PIDS=()
 start_servers() {
 
     local mode="$1"
+    local -a max_num_seqs_flags=()
 
     mkdir -p "$SERVER_LOG_DIR/$mode"
 
@@ -14,6 +15,10 @@ start_servers() {
         sharing_flags="\
             --shared-layers-ptrs-path $SHARED_HANDLES \
             --shared-layers-spec-path $SHARED_SPEC"
+    fi
+
+    if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+        max_num_seqs_flags=(--max-num-seqs "$MAX_NUM_SEQS")
     fi
 
     PIDS=()
@@ -37,6 +42,7 @@ start_servers() {
             --port "$PORT" \
             --no-enable-prefix-caching \
             --disable-log-requests \
+            "${max_num_seqs_flags[@]}" \
             $sharing_flags \
             > "$SERVER_LOG_DIR/$mode/server_${PORT}.log" 2>&1 &
 
