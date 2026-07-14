@@ -95,6 +95,7 @@ start_gpu_allocators() {
 
         CUDA_VISIBLE_DEVICES="$gpu" python3 "$SCRIPT_DIR/gpu_alloc.py" "$alloc_gib" &
         GPU_ALLOC_PIDS+=("$!")
+        sleep 5s
     done
 }
 
